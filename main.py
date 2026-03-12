@@ -4,7 +4,6 @@ import asyncio
 import uuid
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
-from collections import defaultdict
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F, types
@@ -29,24 +28,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ------------------- KONFIGURATSIYA -------------------
-MAIN_BOT_TOKEN = os.getenv("BOT_TOKEN")  # Asosiy platforma boti tokeni
+MAIN_BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not MAIN_BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi!")
 
+# Neon database URL'lari (pooler manzili bo‘lishi kerak)
 DATABASE1_URL = os.getenv("DATABASE1_URL")
 DATABASE2_URL = os.getenv("DATABASE2_URL")
 if not DATABASE1_URL or not DATABASE2_URL:
     raise ValueError("DATABASE1_URL va DATABASE2_URL berilishi kerak!")
 
+# Neon pooling uchun maxsus parametr
+NEON_POOLING = "?pgbouncer=true"
+
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS")
 ADMIN_IDS = [int(x) for x in ADMIN_IDS_STR.split(",")] if ADMIN_IDS_STR else []
-CHANNEL_ID_STR = os.getenv("CHANNEL_ID")   # Hisobot kanali (ixtiyoriy)
+CHANNEL_ID_STR = os.getenv("CHANNEL_ID")
 CHANNEL_ID = int(CHANNEL_ID_STR) if CHANNEL_ID_STR else None
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 if not RENDER_EXTERNAL_URL:
     raise ValueError("RENDER_EXTERNAL_URL topilmadi!")
-WEBHOOK_PATH = "/webhook/{token}"  # tokenni URL dan olish uchun
+WEBHOOK_PATH = "/webhook/{token}"
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", 8080))
 
@@ -82,8 +85,8 @@ async def create_tables(conn: asyncpg.Connection):
             users_count INTEGER DEFAULT 0,
             status TEXT DEFAULT 'active',
             connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            type TEXT DEFAULT 'user_bot',  -- 'platform' yoki 'user_bot'
-            required_channel TEXT,          -- bot uchun majburiy kanal (username)
+            type TEXT DEFAULT 'user_bot',
+            required_channel TEXT,
             FOREIGN KEY (owner_id) REFERENCES users(telegram_id) ON DELETE CASCADE
         )
     """)
@@ -116,24 +119,55 @@ async def create_tables(conn: asyncpg.Connection):
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_users_bot ON bot_users(bot_id)")
 
 async def init_db():
-    db.pool1 = await asyncpg.create_pool(DATABASE1_URL, ssl="require")
-    db.pool2 = await asyncpg.create_pool(DATABASE2_URL, ssl="require")
-    async with db.pool1.acquire() as conn:
-        await create_tables(conn)
-    async with db.pool2.acquire() as conn:
-        await create_tables(conn)
-    print("✅ Ikkala PostgreSQL ga ulandi va jadvallar yaratildi")
+    """Neon uchun optimallashtirilgan pool yaratish."""
+    try:
+        # Neon 1 pool
+        db.pool1 = await asyncpg.create_pool(
+            DATABASE1_URL + NEON_POOLING,
+            ssl="require",
+            min_size=1,
+            max_size=2,                     # Neon bepul limiti 5, shuning uchun 2+2=4 < 5
+            max_queries=5000,
+            max_inactive_connection_lifetime=60,
+            command_timeout=30,
+            timeout=30,
+            server_settings={'application_name': 'stars_bot_1'}
+        )
+        print("✅ Neon 1 pool yaratildi")
+
+        # Neon 2 pool
+        db.pool2 = await asyncpg.create_pool(
+            DATABASE2_URL + NEON_POOLING,
+            ssl="require",
+            min_size=1,
+            max_size=2,
+            max_queries=5000,
+            max_inactive_connection_lifetime=60,
+            command_timeout=30,
+            timeout=30,
+            server_settings={'application_name': 'stars_bot_2'}
+        )
+        print("✅ Neon 2 pool yaratildi")
+
+        # Jadvallarni yaratish
+        async with db.pool1.acquire() as conn:
+            await create_tables(conn)
+        async with db.pool2.acquire() as conn:
+            await create_tables(conn)
+        print("✅ Jadvallar yaratildi")
+    except Exception as e:
+        logging.exception("❌ Neon DB ga ulanishda xatolik")
+        raise
 
 async def close_db():
     if db.pool1:
         await db.pool1.close()
     if db.pool2:
         await db.pool2.close()
+    print("🔌 Barcha pool'lar yopildi")
 
 # ------------------- BOT MA'LUMOTLARI FUNKSIYALARI -------------------
 async def get_bot_info(bot_token: str) -> Optional[Dict]:
-    """Berilgan token haqida ma'lumot qaytaradi (qaysi shardda bo'lsa)."""
-    # token qaysi user'ga tegishli? owner_id ni bilmaymiz, ikkala shardda qidiramiz
     async def search(pool):
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM bots WHERE bot_token = $1", bot_token)
@@ -145,7 +179,6 @@ async def get_bot_info(bot_token: str) -> Optional[Dict]:
     return None
 
 async def update_bot_channel(bot_token: str, channel: str, owner_id: int) -> bool:
-    """Botning majburiy kanalini yangilaydi (faqat egasi qila oladi)."""
     pool = get_shard(owner_id)
     async with pool.acquire() as conn:
         result = await conn.execute(
@@ -170,7 +203,7 @@ async def add_bot(bot_token: str, bot_username: str, owner_id: int):
         await conn.execute("UPDATE users SET bots_count = bots_count + 1 WHERE telegram_id = $1", owner_id)
 
 async def remove_bot(bot_token: str, owner_id: int) -> bool:
-    pool = get_shard( owner_id)
+    pool = get_shard(owner_id)
     async with pool.acquire() as conn:
         result = await conn.execute("DELETE FROM bots WHERE bot_token = $1 AND owner_id = $2", bot_token, owner_id)
         if result == "DELETE 1":
@@ -288,7 +321,6 @@ async def get_total_balance() -> int:
     return (s1 or 0) + (s2 or 0)
 
 # ------------------- BOT INSTANCE CACHE -------------------
-# token -> Bot object
 bot_instances: Dict[str, Bot] = {}
 
 def get_bot_instance(token: str) -> Bot:
@@ -296,19 +328,18 @@ def get_bot_instance(token: str) -> Bot:
         bot_instances[token] = Bot(token=token)
     return bot_instances[token]
 
-# ------------------- DISPATCHER (umumiy) -------------------
+# ------------------- DISPATCHER -------------------
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ------------------- MAJBURIY OBUNA TEKSHIRISH (umumiy) -------------------
+# ------------------- MAJBURIY OBUNA TEKSHIRISH -------------------
 async def check_subscription(user_id: int, bot_token: str) -> Tuple[bool, Optional[str]]:
-    """Foydalanuvchi botning majburiy kanaliga a'zomi? (True/False, kanal nomi)"""
     bot_info = await get_bot_info(bot_token)
     if not bot_info or not bot_info.get('required_channel'):
         return True, None
     channel = bot_info['required_channel']
     try:
-        bot = get_bot_instance(bot_token)  # shu botning o'zidan foydalanamiz
+        bot = get_bot_instance(bot_token)
         chat = await bot.get_chat(channel)
         member = await bot.get_chat_member(chat_id=chat.id, user_id=user_id)
         return member.status in ["member", "administrator", "creator"], channel
@@ -350,19 +381,35 @@ def bot_settings_menu(bot_token: str) -> InlineKeyboardMarkup:
 
 # ------------------- TOKEN MASKI -------------------
 def mask_token(token: str) -> str:
-    """Tokenning faqat oxirgi 6 belgisini ko'rsatadi, qolganini # bilan almashtiradi."""
     if len(token) <= 6:
         return token
     return "#" * (len(token) - 6) + token[-6:]
 
-# ------------------- UMUMIY HANDLERLAR (barcha botlar uchun) -------------------
+# ------------------- HOLATLAR -------------------
+class BotUlashState(StatesGroup):
+    token_kutish = State()
+
+class SetChannelState(StatesGroup):
+    channel_kutish = State()
+
+class ReklamaYuborishState(StatesGroup):
+    xabar_kutish = State()
+    tasdiqlash = State()
+
+class BalanceEditState(StatesGroup):
+    user_id_kutish = State()
+    miqdor_kutish = State()
+
+class PaymentLinkState(StatesGroup):
+    link_kutish = State()
+
+# ------------------- UMUMIY HANDLERLAR -------------------
 @dp.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot):
     token = bot.token
     user_id = message.from_user.id
     await update_user(user_id, message.from_user.username or "", message.from_user.first_name or "", user_id in ADMIN_IDS)
 
-    # Majburiy obuna tekshiruvi
     ok, channel = await check_subscription(user_id, token)
     if not ok:
         await message.answer(
@@ -374,7 +421,6 @@ async def cmd_start(message: Message, bot: Bot):
         )
         return
 
-    # Agar bu platforma boti bo'lsa, to'liq menyu chiqaramiz
     if token == MAIN_BOT_TOKEN:
         await message.answer(
             "🤖 *BOT PLATFORM*\n\nQuyidagilardan birini tanlang:",
@@ -382,9 +428,8 @@ async def cmd_start(message: Message, bot: Bot):
             parse_mode="Markdown"
         )
     else:
-        # User boti uchun sodda xabar
         bot_info = await get_bot_info(token)
-        owner_name = bot_info.get('owner_name', 'Nomaʼlum') if bot_info else 'Nomaʼlum'
+        owner_name = (await get_user(bot_info['owner_id']) or {}).get('username', 'Nomaʼlum')
         await message.answer(
             f"👋 Xush kelibsiz! Bu @{bot_info['bot_username']} boti.\n"
             f"👤 Egasi: @{owner_name}\n"
@@ -438,25 +483,16 @@ async def cmd_stats(message: Message, bot: Bot):
     await message.answer(text, parse_mode="Markdown")
 
 # ------------------- PLATFORMA BOTIGA XOS HANDLERLAR -------------------
-# Ushbu handlerlar faqat MAIN_BOT_TOKEN bo'lganda ishlaydi
 @dp.message(F.text == "🤖 Bot ulash")
 async def platform_bot_ulash(message: Message, bot: Bot, state: FSMContext):
     if bot.token != MAIN_BOT_TOKEN:
         return
-    # ... (avvalgi bot_ulash_start kodi)
     await state.set_state(BotUlashState.token_kutish)
     await message.answer(
         "🤖 *Bot token yuboring*\n\nMasalan: `1234567890:ABCdefGHIjklMNOpqrsTUVwxyz`",
         reply_markup=cancel_menu(),
         parse_mode="Markdown"
     )
-
-# Holatlar
-class BotUlashState(StatesGroup):
-    token_kutish = State()
-
-class SetChannelState(StatesGroup):
-    channel_kutish = State()
 
 @dp.message(BotUlashState.token_kutish, F.text == "❌ Bekor qilish")
 async def cancel_bot_ulash(message: Message, state: FSMContext, bot: Bot):
@@ -470,7 +506,6 @@ async def receive_token(message: Message, state: FSMContext, bot: Bot):
     if bot.token != MAIN_BOT_TOKEN:
         return
     token = message.text.strip()
-    # Token validatsiyasi
     try:
         temp_bot = Bot(token=token)
         me = await temp_bot.get_me()
@@ -486,7 +521,6 @@ async def receive_token(message: Message, state: FSMContext, bot: Bot):
         return
     await add_bot(token, bot_username, user_id)
 
-    # Webhook'ni o'rnatish (bu bot uchun)
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/{token}"
     await temp_bot.set_webhook(webhook_url)
 
@@ -532,7 +566,6 @@ async def unlink_bot(callback: CallbackQuery, bot: Bot):
     if not removed:
         await callback.answer("❌ Bot topilmadi yoki sizga tegishli emas.", show_alert=True)
         return
-    # Webhook'ni o'chirish
     try:
         temp_bot = Bot(token=token)
         await temp_bot.delete_webhook()
@@ -609,23 +642,253 @@ async def set_channel_receive(message: Message, state: FSMContext, bot: Bot):
         await message.answer("❌ Xatolik yuz berdi.", reply_markup=platform_main_menu(user_id))
     await state.clear()
 
+# ------------------- ADMIN HANDLERLARI -------------------
+@dp.message(F.text == "📢 Reklama yuborish")
+async def reklama_start(message: Message, bot: Bot, state: FSMContext):
+    if bot.token != MAIN_BOT_TOKEN or message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(ReklamaYuborishState.xabar_kutish)
+    await message.answer("📝 Reklama matnini yuboring:", reply_markup=cancel_menu())
+
+@dp.message(ReklamaYuborishState.xabar_kutish, F.text == "❌ Bekor qilish")
+async def reklama_cancel(message: Message, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    await state.clear()
+    await message.answer("❌ Bekor qilindi.", reply_markup=platform_main_menu(message.from_user.id))
+
+@dp.message(ReklamaYuborishState.xabar_kutish)
+async def reklama_receive(message: Message, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    await state.update_data(text=message.text, entities=message.entities)
+    await state.set_state(ReklamaYuborishState.tasdiqlash)
+    await message.answer(
+        "📨 Reklama tayyor. Yuboramizmi?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Ha, hammaga yubor", callback_data="send_all")],
+            [InlineKeyboardButton(text="🤖 Faqat bot egalariga", callback_data="send_owners")],
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_send")]
+        ])
+    )
+
+@dp.callback_query(ReklamaYuborishState.tasdiqlash)
+async def reklama_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    data = await state.get_data()
+    text = data['text']
+    entities = data.get('entities')
+
+    if callback.data == "cancel_send":
+        await state.clear()
+        await callback.message.edit_text("❌ Bekor qilindi.")
+        await callback.answer()
+        return
+
+    async def get_all_users(pool):
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT telegram_id FROM users")
+            return [r['telegram_id'] for r in rows]
+
+    async def get_owners(pool):
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT DISTINCT owner_id FROM bots")
+            return [r['owner_id'] for r in rows]
+
+    if callback.data == "send_owners":
+        users1, users2 = await asyncio.gather(get_owners(db.pool1), get_owners(db.pool2))
+    else:
+        users1, users2 = await asyncio.gather(get_all_users(db.pool1), get_all_users(db.pool2))
+
+    user_ids = list(set(users1 + users2))
+    await callback.message.edit_text(f"⏳ Yuborilmoqda... {len(user_ids)} ta foydalanuvchiga")
+
+    success = 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text, entities=entities)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logging.error(f"Reklama yuborishda xatolik {uid}: {e}")
+
+    await callback.message.answer(f"✅ Reklama yuborildi. Muvaffaqiyatli: {success}/{len(user_ids)}")
+    await state.clear()
+    await callback.answer()
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN or message.from_user.id not in ADMIN_IDS:
+        return
+    total_users = await get_total_users()
+    total_bots = await get_total_bots()
+    total_balance = await get_total_balance()
+    text = (f"👑 *Admin panel*\n\n"
+            f"👥 Foydalanuvchilar: {total_users}\n"
+            f"🤖 Ulangan botlar: {total_bots}\n"
+            f"💰 Umumiy balans: {total_balance} so'm")
+    await message.answer(text, parse_mode="Markdown", reply_markup=admin_settings_menu())
+
+def admin_settings_menu():
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="💰 Balans qo'shish", callback_data="admin_add_balance"))
+    builder.add(InlineKeyboardButton(text="🔗 To'lov havolasini sozlash", callback_data="admin_set_payment"))
+    builder.add(InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats"))
+    builder.adjust(1)
+    return builder.as_markup()
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    total_users = await get_total_users()
+    total_bots = await get_total_bots()
+    total_balance = await get_total_balance()
+    text = (f"📊 *Statistika*\n\n"
+            f"👥 Foydalanuvchilar: {total_users}\n"
+            f"🤖 Botlar: {total_bots}\n"
+            f"💰 Umumiy balans: {total_balance} so'm")
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_settings_menu())
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_balance")
+async def admin_add_balance_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    await callback.message.edit_text("Foydalanuvchi Telegram ID sini yuboring:")
+    await state.set_state(BalanceEditState.user_id_kutish)
+    await callback.answer()
+
+@dp.message(BalanceEditState.user_id_kutish, F.text == "❌ Bekor qilish")
+async def balance_cancel(message: Message, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    await state.clear()
+    await message.answer("❌ Bekor qilindi.", reply_markup=platform_main_menu(message.from_user.id))
+
+@dp.message(BalanceEditState.user_id_kutish)
+async def balance_user_id(message: Message, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    try:
+        target_id = int(message.text.strip())
+        await state.update_data(target_id=target_id)
+        await state.set_state(BalanceEditState.miqdor_kutish)
+        await message.answer("Qancha so'm qo'shish kerak?", reply_markup=cancel_menu())
+    except ValueError:
+        await message.answer("❌ Noto'g'ri ID. Qaytadan urinib ko'ring yoki bekor qiling.")
+
+@dp.message(BalanceEditState.miqdor_kutish)
+async def balance_amount(message: Message, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    try:
+        amount = int(message.text.strip())
+        data = await state.get_data()
+        target_id = data['target_id']
+        await add_balance(target_id, amount, message.from_user.id, "Admin tomonidan qo'shildi")
+        await state.clear()
+        await message.answer(f"✅ {amount} so'm foydalanuvchi {target_id} ga qo'shildi.", reply_markup=platform_main_menu(message.from_user.id))
+    except ValueError:
+        await message.answer("❌ Noto'g'ri miqdor. Qaytadan urinib ko'ring.")
+
+@dp.callback_query(F.data == "admin_set_payment")
+async def admin_set_payment_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    current = await get_payment_link()
+    text = f"🔗 Hozirgi to'lov havolasi: {current or 'O‘rnatilmagan'}\n\nYangi havolani yuboring (yoki /cancel):"
+    await callback.message.edit_text(text)
+    await state.set_state(PaymentLinkState.link_kutish)
+    await callback.answer()
+
+@dp.message(PaymentLinkState.link_kutish, F.text == "❌ Bekor qilish")
+async def payment_cancel(message: Message, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    await state.clear()
+    await message.answer("❌ Bekor qilindi.", reply_markup=platform_main_menu(message.from_user.id))
+
+@dp.message(PaymentLinkState.link_kutish)
+async def payment_link_set(message: Message, state: FSMContext, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    link = message.text.strip()
+    await set_payment_link(link)
+    await state.clear()
+    await message.answer("✅ To'lov havolasi saqlandi.", reply_markup=platform_main_menu(message.from_user.id))
+
+@dp.message(F.text == "👤 Mening balansim")
+async def my_balance(message: Message, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    user_id = message.from_user.id
+    ok, channel = await check_subscription(user_id, bot.token)
+    if not ok:
+        await message.answer(f"❌ Avval {channel} kanaliga a'zo bo'ling!")
+        return
+    bal = await get_balance(user_id)
+    payment_link = await get_payment_link()
+    text = f"💰 Sizning balansingiz: *{bal} so'm*\n\n"
+    if payment_link:
+        text += f"🔗 Toʻlov qilish: {payment_link}\n\n"
+    text += "Balans toʻlgandan soʻng, admin uni qoʻlda qoʻshadi."
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "⭐ Stars sotib olish")
+async def stars_sotib_olish(message: Message, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    user_id = message.from_user.id
+    ok, channel = await check_subscription(user_id, bot.token)
+    if not ok:
+        await message.answer(f"❌ Avval {channel} kanaliga a'zo bo'ling!")
+        return
+    price_per_star = 100
+    text = (f"⭐ *Stars paketlari*\n\n"
+            f"• 10 Stars – {price_per_star*10} so'm\n"
+            f"• 50 Stars – {price_per_star*50} so'm\n"
+            f"• 100 Stars – {price_per_star*100} so'm\n\n"
+            f"💳 Sotib olish uchun /buy 10 (yoki 50, 100) deb yozing.\n\n"
+            f"💰 Balansingiz: {await get_balance(user_id)} so'm")
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("buy"))
+async def buy_stars(message: Message, command: CommandObject, bot: Bot):
+    if bot.token != MAIN_BOT_TOKEN:
+        return
+    user_id = message.from_user.id
+    ok, channel = await check_subscription(user_id, bot.token)
+    if not ok:
+        await message.answer(f"❌ Avval {channel} kanaliga a'zo bo'ling!")
+        return
+    if not command.args:
+        await message.answer("❌ Miqdorni kiriting. Masalan: /buy 10")
+        return
+    try:
+        stars = int(command.args)
+        price_per_star = 100
+        amount = stars * price_per_star
+        if await deduct_balance(user_id, amount):
+            await message.answer(f"✅ {stars} stars muvaffaqiyatli sotib olindi! Balans: {await get_balance(user_id)} so'm")
+        else:
+            await message.answer("❌ Balansingizda yetarli mablag' yo'q.")
+    except ValueError:
+        await message.answer("❌ Noto'g'ri miqdor.")
+
 # ------------------- WEBHOOK ROUTER -------------------
 async def handle_webhook(request: web.Request) -> web.Response:
     token = request.match_info.get('token')
     if not token:
         return web.Response(status=404, text="Token not found")
-
-    # Bot instance'ni olish
     bot = get_bot_instance(token)
-    # Update ni o'qish
     try:
         update_data = await request.json()
         update = Update.model_validate(update_data, context={"bot": bot})
     except Exception as e:
         logging.error(f"Update parse error: {e}")
         return web.Response(status=400, text="Invalid update")
-
-    # Dispatcher orqali qayta ishlash
     try:
         await dp.feed_update(bot, update)
     except Exception as e:
@@ -636,7 +899,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
 # ------------------- WEBHOCH SOZLASH -------------------
 async def on_startup(app: web.Application):
     await init_db()
-    # Asosiy bot uchun webhook o'rnatish
     main_bot = get_bot_instance(MAIN_BOT_TOKEN)
     main_webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/{MAIN_BOT_TOKEN}"
     await main_bot.set_webhook(main_webhook_url)
@@ -644,7 +906,6 @@ async def on_startup(app: web.Application):
 
 async def on_shutdown(app: web.Application):
     await close_db()
-    # Barcha botlarning webhook'larini o'chirish (ixtiyoriy)
     for token, bot in bot_instances.items():
         try:
             await bot.delete_webhook()
