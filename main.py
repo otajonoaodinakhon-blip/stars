@@ -51,7 +51,7 @@ if not RENDER_EXTERNAL_URL:
     raise ValueError("RENDER_EXTERNAL_URL topilmadi!")
 WEBHOOK_PATH = "/webhook/{token}"
 WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", 8080))
+WEBAPP_PORT = int(os.getenv("PORT", 10000))  # Render default port 10000
 
 # ------------------- DATABASE POOLLAR -------------------
 class Database:
@@ -126,7 +126,7 @@ async def init_db():
             DATABASE1_URL + NEON_POOLING,
             ssl="require",
             min_size=1,
-            max_size=2,                     # Neon bepul limiti 5, shuning uchun 2+2=4 < 5
+            max_size=2,
             max_queries=5000,
             max_inactive_connection_lifetime=60,
             command_timeout=30,
@@ -877,6 +877,11 @@ async def buy_stars(message: Message, command: CommandObject, bot: Bot):
     except ValueError:
         await message.answer("❌ Noto'g'ri miqdor.")
 
+# ------------------- HEALTH CHECK ENDPOINT -------------------
+async def health(request: web.Request) -> web.Response:
+    """Render health check uchun oddiy javob."""
+    return web.Response(text="OK", status=200)
+
 # ------------------- WEBHOOK ROUTER -------------------
 async def handle_webhook(request: web.Request) -> web.Response:
     token = request.match_info.get('token')
@@ -896,7 +901,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.Response(status=500, text="Error processing update")
     return web.Response(status=200, text="OK")
 
-# ------------------- WEBHOCH SOZLASH -------------------
+# ------------------- WEBHOOK SOZLASH -------------------
 async def on_startup(app: web.Application):
     await init_db()
     main_bot = get_bot_instance(MAIN_BOT_TOKEN)
@@ -906,9 +911,11 @@ async def on_startup(app: web.Application):
 
 async def on_shutdown(app: web.Application):
     await close_db()
+    # Barcha bot sessiyalarini yopish
     for token, bot in bot_instances.items():
         try:
             await bot.delete_webhook()
+            await bot.session.close()
         except:
             pass
     print("🔴 Bot to‘xtatildi")
@@ -916,6 +923,7 @@ async def on_shutdown(app: web.Application):
 def main():
     app = web.Application()
     app.router.add_post('/webhook/{token}', handle_webhook)
+    app.router.add_get('/health', health)  # health check endpoint
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
